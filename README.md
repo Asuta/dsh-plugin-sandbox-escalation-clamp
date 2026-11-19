@@ -4,6 +4,19 @@ Withdraws the `sandbox_permissions` + `justification` pair from the model-facing
 schema of confining tools, and repairs escalation arguments that cannot produce a
 grant, for every agent whose session can never widen its sandbox.
 
+## Install
+
+In DSH Desktop, open **Plugins** → **Add plugin** and pass the repository URL or a
+local checkout directory:
+
+```
+https://github.com/Asuta/dsh-plugin-sandbox-escalation-clamp
+```
+
+The bundle links into the active profile and activates through HMR. Enable or
+disable its row in **Plugins** to toggle the clamp for every session in that
+profile.
+
 ## Why
 
 DSH advertises those two parameters on tools such as `pwsh` and `bash` whenever a
