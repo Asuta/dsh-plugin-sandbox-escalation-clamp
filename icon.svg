@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="Sandbox escalation clamp">
+  <rect x="4" y="4" width="88" height="88" rx="22" fill="#1f2937"/>
+  <path d="M48 20 70 29v18c0 15-9.4 25.2-22 30-12.6-4.8-22-15-22-30V29z" fill="#f9fafb" opacity="0.12"/>
+  <path d="M48 20 70 29v18c0 15-9.4 25.2-22 30-12.6-4.8-22-15-22-30V29z" fill="none" stroke="#93c5fd" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M38 48h20M38 56h20" stroke="#e5e7eb" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="48" cy="38" r="6" fill="none" stroke="#e5e7eb" stroke-width="4"/>
+  <path d="M30 70 66 30" stroke="#f87171" stroke-width="5" stroke-linecap="round"/>
+</svg>

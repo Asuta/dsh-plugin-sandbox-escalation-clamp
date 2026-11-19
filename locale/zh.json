@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "沙箱升权参数收敛",
+    "description": "当会话不可能升权时（审批为 `never`，或当前沙箱已是 `danger-full-access`），从工具的模型可见 schema 中撤下 `sandbox_permissions`/`justification`，并在执行前修掉无法生效的升权参数，让命令正常执行而不是卡在参数校验上；仍然出现的升权错误会被改写成一句明确的修复指令。作用于配置中列出的工具，覆盖所有 agent，也包括插件加载前已存在的会话。在「插件」页关闭本插件即可恢复 DSH 原生 schema 与报错。"
+  }
+}

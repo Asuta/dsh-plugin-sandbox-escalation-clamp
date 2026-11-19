@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Sandbox escalation clamp",
+    "description": "Withdraws `sandbox_permissions`/`justification` from a tool's model-facing schema and repairs non-widening escalation arguments whenever the session can never escalate: approvals are `never`, or the standing sandbox mode is already `danger-full-access`. Commands keep running instead of failing argument validation, and any remaining escalation error is rewritten into one instruction that names the exact fix. Applies to the configured tools on every agent, including sessions created before the plugin loaded. Turn the plugin off in Plugins to restore the stock schemas and messages."
+  }
+}

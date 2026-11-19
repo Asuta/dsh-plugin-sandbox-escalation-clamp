@@ -1,0 +1,10 @@
+- insert:
+    - id: sandbox-escalation-clamp
+      name: '@local/dsh-plugin-sandbox-escalation-clamp'
+      config:
+        hideEscalationFields: true
+        repairCalls: true
+        explainErrors: true
+        tools:
+          - pwsh
+          - bash
