@@ -2,26 +2,37 @@
  * Sandbox escalation clamp.
  *
  * A session whose sandbox policy can never be widened still receives the
- * `sandbox_permissions` + `justification` parameters of every confining tool
- * (pwsh, bash, write, edit). A model that fills those parameters anyway is
- * rejected by argument validation before the command runs — the failure mode
- * observed in session-400b8db7, where 22 identical `pwsh` calls all died on
- * `invalid justification: expected a non-empty sentence`.
+ * `sandbox_permissions` + `justification` parameters of every confining tool.
+ * Which tools carry them is decided by the mounted capabilities, not by this
+ * plugin: with both a confining filesystem and a confining shell the pair is
+ * advertised on `write`, `edit`, `pwsh` and `bash` alike. A model that fills
+ * those parameters anyway is rejected inside the tool body — the failure mode
+ * observed in session-400b8db7 (22 identical `pwsh` calls dying on
+ * `invalid justification: expected a non-empty sentence`) repeated in
+ * session-ba3291a0 on `write`, because an earlier version clamped only the
+ * tools named in its own configuration.
  *
  * This plugin removes that trap for the agents that cannot escalate:
  *
  * - Hide: an agent-scoped shadow definition whose `parameters` never advertise
  *   the escalation pair while the session cannot widen (approval policy `never`,
- *   or standing mode already `danger-full-access`).
+ *   or standing mode already `danger-full-access`). A session that can still
+ *   escalate keeps the stock schema, so legitimate escalation is untouched.
  * - Repair: the shadow delegates execution to the inherited tool definition after
  *   dropping escalation arguments that cannot produce a grant, so the command
  *   runs instead of failing validation.
  * - Explain: a remaining escalation error is rewritten into one actionable
- *   instruction naming the exact fix.
+ *   instruction naming the tool and the exact fix.
+ *
+ * The clamp discovers its targets instead of trusting a hand-maintained list:
+ * every tool the agent resolves that advertises either escalation parameter is
+ * shadowed, and the registry's `tools/change` notification re-scans after a
+ * capability registers late, so a tool mounted after the agent was created is
+ * still covered from the next step onward.
  *
  * Tools resolve from the preset or global scope the agent inherits, so the
- * definition is captured once per agent at `agent/created`; the schema getter
- * still re-evaluates the session's current policy on every projection.
+ * definition is captured once per agent; the schema getter still re-evaluates
+ * the session's current policy on every projection.
  *
  * @module @local/dsh-plugin-sandbox-escalation-clamp
  */
@@ -43,15 +54,29 @@ const WIDER_MODES = {
 }
 
 /**
+ * Names that can never be shadowed. `run_code` is the reserved PTC transport:
+ * the registry rejects any registration of that name, and the nested calls it
+ * dispatches are clamped by the tools they reach, not by the transport.
+ */
+const RESERVED_TOOL_NAMES = new Set(['run_code'])
+
+/**
  * Configuration keys consumed by {@link apply}. Declared here for readers only:
  * the bundle exports no `Config` schema, so no package import is required at
  * load time and the row's `config` reaches `apply` as written.
+ *
+ * `discover` (default `true`) is what keeps the clamp complete: it shadows every
+ * tool that advertises the escalation pair rather than the names listed in
+ * `tools`. Set it to `false` together with an explicit `tools` list only to
+ * clamp a fixed subset.
  */
 export const CONFIG_KEYS = Object.freeze({
+  discover: true,
+  tools: [],
+  exclude: [],
   hideEscalationFields: true,
   repairCalls: true,
   explainErrors: true,
-  tools: ['pwsh', 'bash'],
 })
 
 /**
@@ -129,6 +154,13 @@ function withoutEscalationFields(parameters) {
 
 /**
  * Drop escalation arguments that cannot produce a grant.
+ *
+ * The tools validate the pair inside their own `execute` (the sandbox escalation
+ * helper throws `SandboxEscalationError` before the mutation or command runs),
+ * so rewriting the arguments before delegating is enough to let the call
+ * succeed; the model-facing schema is what keeps the pair from being sent at
+ * all.
+ *
  * @param ctx - plugin context.
  * @param session - the calling agent's session.
  * @param args - parsed model arguments.
@@ -155,24 +187,23 @@ function clampArguments(ctx, session, args) {
  *
  * The inherited definition is captured once: tool plugins resolve from the
  * preset/global scope, whose registrations are final by `agent/created`, and an
- * agent-scoped shadow hides the inherited entry from further lookup.
+ * agent-scoped shadow hides the inherited entry from further lookup. Every other
+ * field is copied as-is so presentation, timeout, and safety classification keep
+ * behaving exactly like the inherited tool.
  *
  * @param ctx - plugin context.
  * @param agent - the agent that owns the shadow.
- * @param toolName - registered tool name.
  * @param definition - the definition this agent currently resolves.
  * @param settings - resolved plugin configuration.
  * @returns a definition that delegates to the captured definition.
  */
-function createShadow(ctx, agent, toolName, definition, settings) {
-  const shadow = { name: definition.name, output: definition.output }
-  for (const key of ['deferLoading', 'timeoutMs', 'isConcurrencySafe', 'presentCall', 'presentResult', 'projectContent', 'finalizeContent']) {
-    if (definition[key] !== undefined) shadow[key] = definition[key]
-  }
+function createShadow(ctx, agent, definition, settings) {
+  const shadow = { ...definition }
   Object.defineProperties(shadow, {
-    description: { enumerable: true, get: () => definition.description },
+    description: { enumerable: true, configurable: true, get: () => definition.description },
     parameters: {
       enumerable: true,
+      configurable: true,
       get: () => {
         const hide = settings.hideEscalationFields && escalatesNowhere(ctx, agent.session) !== undefined
         return hide ? withoutEscalationFields(definition.parameters) : definition.parameters
@@ -203,16 +234,18 @@ function carriesEscalation(args) {
  * @param reason - why the session cannot widen, if it cannot.
  * @param mode - the standing mode, when known.
  * @param original - the original model-facing error text.
+ * @param toolName - the tool whose call was refused.
  * @returns replacement text for the tool result.
  */
-function explanation(reason, mode, original) {
+function explanation(reason, mode, original, toolName) {
   const why = reason === 'session-already-full-access'
     ? 'this session already runs at `danger-full-access`, so there is no wider mode to request'
     : reason === 'approval-policy-never'
       ? 'approvals are disabled in this session, so an escalation can never be granted'
       : `\`sandbox_permissions\` must name a strictly wider mode than the standing "${mode ?? 'current'}" mode`
   return `${original}\n\n`
-    + `Remove \`sandbox_permissions\` and \`justification\` from the arguments and issue the identical call again; ${why}.`
+    + `The ${toolName ?? 'tool'} call did not run. Re-issue the identical call without `
+    + `\`sandbox_permissions\` and \`justification\`; ${why}.`
 }
 
 /**
@@ -222,50 +255,105 @@ function explanation(reason, mode, original) {
  */
 export function apply(ctx, config = {}) {
   const settings = {
+    discover: config.discover ?? true,
+    tools: [...new Set(Array.isArray(config.tools) ? config.tools.filter(entry => typeof entry === 'string') : [])],
+    exclude: new Set(Array.isArray(config.exclude) ? config.exclude.filter(entry => typeof entry === 'string') : []),
     hideEscalationFields: config.hideEscalationFields ?? true,
     repairCalls: config.repairCalls ?? true,
     explainErrors: config.explainErrors ?? true,
-    tools: config.tools ?? ['pwsh', 'bash'],
   }
-  const shadows = new Map()
+  /** Per-agent shadow sets, keyed by the agent whose scope owns them. */
+  const records = new Map()
   let active = true
+  /** Re-entrancy guard: our own registrations emit `tools/change`. */
+  let scanning = false
+  /** A registry change that arrived while scanning; re-run once instead of recursing. */
+  let rescan = false
+
+  const liveAgents = () => [...(ctx.get('agents')?.list?.() ?? [])]
+
+  const recordFor = agent => {
+    const existing = records.get(agent)
+    if (existing !== undefined) return existing
+    const record = {
+      names: new Set(),
+      disposers: [],
+      /** Disposers for this agent's shadows, in registration order. */
+      disposeAll: () => { for (const disposer of record.disposers.splice(0)) disposer() },
+      /** Agent-scoped effect that tears the record down with the agent. */
+      owned: undefined,
+    }
+    records.set(agent, record)
+    return record
+  }
+
+  const installShadow = (agent, record, toolName) => {
+    if (RESERVED_TOOL_NAMES.has(toolName) || settings.exclude.has(toolName) || record.names.has(toolName)) return
+    const definition = ctx.tools.get(toolName, agent)
+    if (definition === undefined || !advertisesEscalation(definition.parameters)) return
+    // Claim the name before registering: `register` emits `tools/change`
+    // synchronously, and the re-entrant scan must see the claim as final.
+    record.names.add(toolName)
+    try {
+      if (record.owned === undefined) {
+        record.owned = agent.ctx.effect(() => () => {
+          records.delete(agent)
+          record.disposeAll()
+        }, 'sandbox-escalation-clamp: agent shadow')
+      }
+      record.disposers.push(agent.ctx.tools.register(createShadow(ctx, agent, definition, settings)))
+    } catch (error) {
+      record.names.delete(toolName)
+      ctx.logger?.warn?.(`sandbox-escalation-clamp: cannot shadow "${toolName}": ${String(error)}`)
+    }
+  }
+
+  const clampAgent = agent => {
+    if (!active) return
+    const record = recordFor(agent)
+    for (const toolName of settings.tools) installShadow(agent, record, toolName)
+    if (!settings.discover) return
+    for (const definition of ctx.tools.definitions(agent) ?? []) installShadow(agent, record, definition.name)
+  }
+
+  const scanAll = () => {
+    if (!active) return
+    if (scanning) {
+      rescan = true
+      return
+    }
+    scanning = true
+    try {
+      do {
+        rescan = false
+        for (const agent of liveAgents()) clampAgent(agent)
+      } while (rescan && active)
+    } finally {
+      scanning = false
+    }
+  }
 
   const disposeShadow = agent => {
-    const record = shadows.get(agent)
+    const record = records.get(agent)
     if (record === undefined) return
-    shadows.delete(agent)
+    records.delete(agent)
     record.disposeAll()
-    record.owned()
-  }
-
-  const install = agent => {
-    if (!active || shadows.has(agent)) return
-    const names = [...new Set(settings.tools)].filter(toolName => toolName !== 'run_code')
-    const disposers = []
-    for (const toolName of names) {
-      const definition = ctx.tools.get(toolName, agent)
-      if (definition === undefined || !advertisesEscalation(definition.parameters)) continue
-      try {
-        disposers.push(agent.ctx.tools.register(createShadow(ctx, agent, toolName, definition, settings)))
-      } catch (error) {
-        ctx.logger?.warn?.(`sandbox-escalation-clamp: cannot shadow "${toolName}": ${String(error)}`)
-      }
-    }
-    if (disposers.length === 0) return
-    const record = { disposeAll: () => { for (const disposer of disposers.splice(0)) disposer() } }
-    record.owned = agent.ctx.effect(() => () => record.disposeAll(), 'sandbox-escalation-clamp: agent shadow')
-    shadows.set(agent, record)
+    record.owned?.()
   }
 
   ctx.effect(() => () => {
     active = false
-    for (const agent of [...shadows.keys()]) disposeShadow(agent)
+    for (const agent of [...records.keys()]) disposeShadow(agent)
   }, 'sandbox-escalation-clamp')
 
-  ctx.on('agent/created', ({ agent }) => { install(agent) })
+  ctx.on('agent/created', ({ agent }) => { clampAgent(agent) })
   ctx.on('agent/disposed', ({ agent }) => { disposeShadow(agent) })
 
-  for (const agent of ctx.get('agents')?.list?.() ?? []) install(agent)
+  // A capability that registers after the agent exists (or a session-visible
+  // variant replacing a definition) is picked up here rather than at creation.
+  ctx.on('tools/change', () => { scanAll() })
+
+  for (const agent of liveAgents()) clampAgent(agent)
 
   ctx.on('tools/post-execute', async (exec, result, next) => {
     const decision = await next()
@@ -277,7 +365,7 @@ export function apply(ctx, config = {}) {
     const mode = exec.agent === undefined ? undefined : standingModeOf(ctx, exec.agent.session)
     return {
       kind: 'block',
-      feedback: [{ type: 'text', text: explanation(reason, mode, text) }],
+      feedback: [{ type: 'text', text: explanation(reason, mode, text, exec.name) }],
       ...result.error?.info !== undefined ? { info: result.error.info } : {},
     }
   })

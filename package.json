@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-plugin-sandbox-escalation-clamp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Hide and repair sandbox escalation arguments for sessions that can never escalate.",
@@ -16,6 +16,9 @@
     "icon.svg",
     "README.md"
   ],
+  "scripts": {
+    "test": "node --test"
+  },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" }
   }
