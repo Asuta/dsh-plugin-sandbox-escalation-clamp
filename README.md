@@ -42,70 +42,50 @@ discovers its targets instead of trusting a hand-maintained list.
 
 ## What it does
 
-For each agent (including agents that already existed when the plugin loaded), it
-registers an agent-scoped shadow of **every** tool that advertises the pair:
+DSH resolves the tool first. The plugin adapts the resulting definition for the
+model and for dispatch, preserving the original registration, activation
+condition, scope restrictions, and lifetime. This also covers tools installed
+while a session is open.
 
-- **Hide** — the shadow's `parameters` omit `sandbox_permissions` and
-  `justification` while the session cannot escalate. The getter re-evaluates the
-  session's approval policy and standing mode on every schema projection, so a
-  mid-session policy switch is honored without re-registering.
-- **Repair** — the shadow delegates execution to the inherited tool definition
-  after dropping escalation arguments that cannot produce a grant: the session
-  already cannot widen, the requested mode is not strictly wider than the
-  standing mode, or the justification is blank. The call then runs normally, even
-  when an older turn's arguments are replayed verbatim.
-- **Explain** — an escalation error that still reaches the model is rewritten into
-  its original message plus one instruction naming the tool: drop the pair and
-  re-issue the identical call.
-
-Legitimate escalation is untouched: when the session is confined below
-`danger-full-access` and approvals are `ask`, a strictly wider request with a
-non-empty justification passes through unchanged.
+- **Hide** — omit the pair from the model schema when the session cannot
+  escalate. The next schema projection reads the current session policy.
+- **Repair** — remove stale or malformed escalation fields before the original
+  tool validates its arguments. The original tool still enforces the session's
+  standing permissions. A valid request for a wider mode with approvals enabled
+  reaches the original tool unchanged.
+- **Explain** — add targeted guidance to structured escalation argument errors.
+  An actual filesystem denial retains its error code and denial text. The
+  upgrade hint is removed when escalation is unavailable.
 
 ## Configuration
 
 | Field | Default | Meaning |
 |---|---|---|
-| `discover` | `true` | Shadow every tool the agent resolves that advertises either escalation parameter |
-| `tools` | `[]` | Extra tool names to clamp even when discovery does not see them |
-| `exclude` | `[]` | Tool names to leave untouched (for example a tool whose own escalation handling you want the model to see) |
-| `hideEscalationFields` | `true` | Remove the escalation pair from the shadow's schema while the session cannot escalate |
-| `repairCalls` | `true` | Drop escalation arguments that cannot produce a grant before the tool runs |
-| `explainErrors` | `true` | Append the actionable instruction to a remaining escalation error |
-
-`run_code` is always skipped: it is the reserved PTC transport, cannot be
-shadowed, and its nested calls are clamped by the tools they reach.
-
-Set `discover: false` together with an explicit `tools` list to clamp a fixed
-subset again.
+| `discover` | `true` | Include visible tools that declare both optional DSH escalation fields and the recognized target enum |
+| `tools` | `[]` | Select tool names when `discover` is `false`. Each still needs the DSH escalation fields |
+| `exclude` | `[]` | Exclude these tools from schema, argument, and error changes |
+| `hideEscalationFields` | `true` | Omit the pair from the model schema when escalation is unavailable |
+| `repairCalls` | `true` | Remove stale or malformed escalation fields before validation |
+| `explainErrors` | `true` | Clarify escalation argument errors and suppress impossible escalation hints on filesystem denials |
 
 ## Toggle
 
-The capability lives entirely in this bundle. Disable its row in **Plugins** to
-remove the shadows and restore the stock schemas and messages for every session;
-re-enable to install them again. Turn it off when a session genuinely relies on
-escalation prompts and you want the model to see the parameters.
+Disable the plugin in **Plugins** to restore the stock schemas and tool behavior
+for the profile. Re-enable it to apply the clamp again.
 
-## Limits
+## Compatibility
 
-- The inherited definition is captured once per agent, because an agent-scoped
-  shadow hides the inherited entry from further lookup. A tool that replaces its
-  own definition later (a new object, not a mutation) keeps executing the
-  captured version for agents that already existed; recreate the agent to pick up
-  the new definition. A tool that registers **after** the agent exists is still
-  clamped: the registry's `tools/change` notification triggers a re-scan.
-- Approval policy is read as `ask` when the approval seam is composed, even if no
-  answerer is present; such a session keeps the parameters and fails closed at
-  approval time, as DSH documents.
-- The shadow is an agent-scoped registration, so it shadows the inherited tool for
-  that agent only and disappears with the agent or when the plugin unloads.
+- The adapter uses the Cordis service instance and the two lookup methods of
+  ToolsService verified in DSH `0.2.2-rc.5`. If those methods cannot be wrapped,
+  the plugin logs a warning and leaves the stock tools in place.
+- PTC's registered tools use those lookup methods. The executor owns the reserved
+  `run_code` transport separately, and its own schema and calls are unaffected.
+- A composed approval service can report `ask` with no answerer. The stock tool
+  handles approval in that case.
 
 ## Tests
 
-```
-node --test
-```
-
-The suite drives the plugin through a registry stub that mirrors scoped shadowing
-and `tools/change`, covering discovery, repair, dynamic policy switches,
-late-registered capabilities, `exclude`, and unload.
+Run `node --test` from the package directory. To also exercise the installed DSH
+ToolsService and Cordis runtime, run the same suite using the ASAR-aware Desktop
+runtime with `DSH_CLAMP_INTEGRATION=1` and `DSH_INSTALL_DIR` pointing to the
+installed CLI package. The integration uses a separate in-memory context.

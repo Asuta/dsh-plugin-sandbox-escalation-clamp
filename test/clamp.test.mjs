@@ -1,327 +1,227 @@
-/**
- * Behavioural tests for the escalation clamp, driven through a registry stub
- * that mirrors the parts of `ctx.tools` the plugin uses: scoped shadowing
- * (`get`/`definitions`), a synchronous `tools/change` notification, and the
- * agent-scoped `register` that installs a shadow.
- *
- * Run with `node --test` from the package root.
- */
-
 import assert from 'node:assert/strict'
 import test from 'node:test'
-
 import { apply } from '../index.js'
 
-/** The escalation pair a confining capability advertises. */
-const PAIR = {
-  sandbox_permissions: {
-    type: 'string',
-    enum: ['workspace-write', 'danger-full-access'],
-    description: 'wider mode',
-  },
-  justification: { type: 'string', description: 'why' },
+const pair = {
+  sandbox_permissions: { type: 'string', enum: ['workspace-write', 'danger-full-access'] },
+  justification: { type: 'string' },
+}
+const argumentSchema = {
+  type: 'object',
+  properties: { file_path: { type: 'string' }, content: { type: 'string' }, ...pair },
+  required: ['file_path', 'content'],
+}
+const bareArgs = { file_path: 'clamp-test.txt', content: 'example' }
+const staleArgs = Object.freeze({ ...bareArgs, sandbox_permissions: 'workspace-write', justification: '' })
+const hint = '[sandbox: escalation available — retry this exact operation once with sandbox_permissions (the narrowest wider mode that suffices) + justification; the approval prompt asks the user]'
+const denial = '[sandbox: file access denied under read-only mode]'
+
+// Use prototype getters and private state to test original receiver semantics.
+class FileTool {
+  #label
+  calls = []
+
+  constructor(name = 'write') { this.#label = name }
+  get name() { return this.#label }
+  get description() { return `Use ${this.#label}` }
+  get parameters() { return argumentSchema }
+  get output() { return { schema: { type: 'string' }, render: (_, value) => [{ type: 'text', text: value }] } }
+  get timeoutMs() { return 100 }
+  isConcurrencySafe() { return this.#label === 'write' }
+  presentCall() { return this.#label }
+  presentResult() { return this.#label }
+  projectContent() { return this.#label }
+  finalizeContent() { return this.#label }
+  execute(args, exec) {
+    this.calls.push({ args, exec })
+    return this.#label
+  }
 }
 
-/**
- * One tool definition shaped like `defineTool` output: schema plus an execute
- * that records what it received.
- */
-function tool(name, parameters, { pair = true, value } = {}) {
-  const definition = {
-    name,
-    description: `${name} tool`,
-    parameters: pair
-      ? { type: 'object', properties: { ...parameters, ...PAIR } }
-      : { type: 'object', properties: parameters },
-    output: { schema: { type: 'object', additionalProperties: true }, render: () => [] },
-    seen: [],
-    async execute(args) {
-      definition.seen.push(args)
-      return value ?? { ok: true }
-    },
-  }
-  return definition
-}
-
-/** A tool registry stub with global and per-agent scopes. */
-class Registry {
-  constructor() {
-    this.global = new Map()
-    this.scoped = new Map()
-    this.listeners = []
-  }
-
-  onChange(listener) { this.listeners.push(listener) }
-
-  changed() { for (const listener of [...this.listeners]) listener() }
-
-  table(scope) {
-    if (scope === undefined) return this.global
-    let table = this.scoped.get(scope)
-    if (table === undefined) {
-      table = new Map()
-      this.scoped.set(scope, table)
-    }
-    return table
-  }
-
-  registerFor(scope, definition) {
-    const table = this.table(scope)
-    if (table.has(definition.name)) throw new Error(`tool "${definition.name}" is already registered`)
-    table.set(definition.name, definition)
-    this.changed()
-    return () => {
-      table.delete(definition.name)
-      this.changed()
-    }
-  }
-
-  visible(scope) {
-    const map = new Map(this.global)
-    for (const [name, definition] of this.scoped.get(scope) ?? []) map.set(name, definition)
-    return map
-  }
-
-  get(name, scope) { return this.visible(scope).get(name) }
-
-  definitions(scope) { return [...this.visible(scope).values()] }
-
-  register(definition) { return this.registerFor(undefined, definition) }
-}
-
-/** A plugin context stub with the services the clamp consults. */
-function harness({ mode = 'danger-full-access', policy = 'never', modeAbsent = false } = {}) {
-  const registry = new Registry()
+function harness({ mode = 'danger-full-access', policy = 'never' } = {}) {
+  const registered = new Map()
   const handlers = new Map()
-  const agents = []
+  const effects = []
   const state = { mode, policy }
+  const agent = { session: {} }
+  const registry = {
+    definitions(scope, step) {
+      return [...registered.keys()].map(name => this.executable(name, scope, step)).filter(Boolean)
+    },
+    executable(name, scope, step) {
+      return scope === agent && (!step || step.has(name)) ? registered.get(name) : undefined
+    },
+  }
   const ctx = {
     tools: registry,
-    logger: { warn() {} },
     get(name) {
-      if (name === 'agents') return { list: () => agents }
-      if (name === 'approval') {
-        return state.policy === null
-          ? undefined
-          : { overrideOf: () => undefined, config: { policy: state.policy } }
-      }
-      if (name === 'sandboxPolicy') {
-        return modeAbsent || state.mode === null ? undefined : { resolve: () => ({ mode: state.mode }) }
-      }
-      return undefined
+      if (name === 'sandboxPolicy') return { resolve: () => ({ mode: state.mode }) }
+      if (name === 'approval') return { overrideOf: () => state.policy }
     },
-    on(event, handler) {
-      const list = handlers.get(event) ?? []
-      list.push(handler)
-      handlers.set(event, list)
-    },
-    emit(event, payload) { for (const handler of handlers.get(event) ?? []) handler(payload) },
-    effect(fn) { return fn() },
+    logger: { warn: message => assert.fail(message) },
+    effect(run) { effects.push(run()) },
+    on(event, handler) { handlers.set(event, handler) },
   }
-  registry.onChange(() => ctx.emit('tools/change'))
-  const agent = {
-    name: 'lead',
-    session: { id: 'session-test' },
-    ctx: {
-      tools: { register: definition => registry.registerFor(agent, definition) },
-      effect: fn => fn(),
-    },
-  }
-  agents.push(agent)
-  return { ctx, registry, agent, agents, state, handlers }
+  const run = (name, args, result) => handlers.get('tools/execute')({ agent, name, arguments: args }, async () => result)
+  const parameters = name => registry.definitions(agent).find(tool => tool.name === name).parameters
+  const invoke = (name, args) => registry.executable(name, agent).execute(args, { agent })
+  return { ctx, registry, state, agent, registered, run, parameters, invoke, unload: () => effects.pop()() }
 }
 
-/** The escalation pair still advertised by a tool as one agent sees it. */
-function advertises(registry, agent, name) {
-  const definition = registry.get(name, agent)
-  assert.ok(definition !== undefined, `${name} must resolve`)
-  const properties = definition.parameters?.properties ?? {}
-  return Object.prototype.hasOwnProperty.call(properties, 'sandbox_permissions')
-    || Object.prototype.hasOwnProperty.call(properties, 'justification')
-}
-
-test('discovers every tool that advertises the pair, not just the configured names', () => {
-  const { ctx, registry, agent } = harness()
-  registry.registerFor(undefined, tool('write', { file_path: { type: 'string' }, content: { type: 'string' } }))
-  registry.registerFor(undefined, tool('edit', { file_path: { type: 'string' } }))
-  registry.registerFor(undefined, tool('pwsh', { command: { type: 'string' } }))
-  registry.registerFor(undefined, tool('read', { file_path: { type: 'string' } }, { pair: false }))
-
-  apply(ctx, {})
-
-  for (const name of ['write', 'edit', 'pwsh']) {
-    assert.equal(advertises(registry, agent, name), false, `${name} must be clamped`)
-  }
-  // A tool without the pair keeps the exact registered definition.
-  assert.equal(registry.get('read', agent).description, 'read tool')
-  assert.equal(advertises(registry, agent, 'read'), false)
-})
-
-test('repairs escalation arguments before the tool body validates them', async () => {
-  const { ctx, registry, agent } = harness()
-  const write = tool('write', { file_path: { type: 'string' } })
-  registry.registerFor(undefined, write)
-
-  apply(ctx, {})
-
-  const args = { file_path: 'a.txt', content: 'x', sandbox_permissions: 'workspace-write', justification: '' }
-  const result = await registry.get('write', agent).execute(args, {})
-
-  assert.deepEqual(result, { ok: true })
-  assert.deepEqual(write.seen.at(-1), { file_path: 'a.txt', content: 'x' })
-  // The caller's object is never mutated.
-  assert.equal(args.sandbox_permissions, 'workspace-write')
-})
-
-test('leaves a session that can still escalate untouched', async () => {
-  const { ctx, registry, agent, state } = harness({ mode: 'read-only', policy: 'ask' })
-  const write = tool('write', { file_path: { type: 'string' } })
-  registry.registerFor(undefined, write)
-
-  apply(ctx, {})
-
-  assert.equal(advertises(registry, agent, 'write'), true)
-
-  const sanctioned = { file_path: 'a.txt', sandbox_permissions: 'workspace-write', justification: 'needs the parent dir' }
-  await registry.get('write', agent).execute(sanctioned, {})
-  assert.deepEqual(write.seen.at(-1), sanctioned, 'a strictly wider justified request passes through')
-
-  // A blank justification cannot grant, so the pair is dropped instead of failing validation.
-  await registry.get('write', agent).execute({ file_path: 'a.txt', sandbox_permissions: 'workspace-write', justification: ' ' }, {})
-  assert.deepEqual(write.seen.at(-1), { file_path: 'a.txt' })
-
-  // The schema follows a mid-session policy switch without re-registering.
-  state.policy = 'never'
-  assert.equal(advertises(registry, agent, 'write'), false)
-})
-
-test('clamps a capability that registers after the agent was created', () => {
-  const { ctx, registry, agent } = harness()
-  registry.registerFor(undefined, tool('pwsh', { command: { type: 'string' } }))
-  apply(ctx, {})
-
-  const late = tool('apply_patch', { patch: { type: 'string' } })
-  registry.registerFor(undefined, late)
-
-  assert.equal(advertises(registry, agent, 'apply_patch'), false)
-  assert.notEqual(registry.get('apply_patch', agent), late)
-})
-
-test('discover: false clamps only the configured tools', () => {
-  const { ctx, registry, agent } = harness()
-  registry.registerFor(undefined, tool('write', { file_path: { type: 'string' } }))
-  registry.registerFor(undefined, tool('pwsh', { command: { type: 'string' } }))
-
-  apply(ctx, { discover: false, tools: ['pwsh'] })
-
-  assert.equal(advertises(registry, agent, 'pwsh'), false)
-  assert.equal(advertises(registry, agent, 'write'), true)
-})
-
-test('exclude keeps a named tool out of the clamp', () => {
-  const { ctx, registry, agent } = harness()
-  registry.registerFor(undefined, tool('write', { file_path: { type: 'string' } }))
-  registry.registerFor(undefined, tool('pwsh', { command: { type: 'string' } }))
-
-  apply(ctx, { exclude: ['write'] })
-
-  assert.equal(advertises(registry, agent, 'write'), true)
-  assert.equal(advertises(registry, agent, 'pwsh'), false)
-})
-
-test('does nothing when no sandbox policy service is composed', () => {
-  const { ctx, registry, agent } = harness({ modeAbsent: true })
-  registry.registerFor(undefined, tool('write', { file_path: { type: 'string' } }))
-
-  apply(ctx, {})
-
-  assert.equal(advertises(registry, agent, 'write'), true)
-})
-
-test('rewrites a refused escalation into one actionable instruction', async () => {
-  const { ctx, registry, agent, handlers } = harness()
-  registry.registerFor(undefined, tool('write', { file_path: { type: 'string' } }))
-  apply(ctx, {})
-
-  const post = handlers.get('tools/post-execute')
-  assert.equal(post.length, 1)
-
-  const exec = {
-    name: 'write',
-    agent,
-    arguments: { file_path: 'a.txt', sandbox_permissions: 'workspace-write', justification: '' },
-  }
-  const result = {
+function failure(code, message) {
+  return {
     isError: true,
-    content: [{ type: 'text', text: 'Error: invalid justification: expected a non-empty sentence' }],
+    error: { message, info: { name: 'ExampleError', code } },
+    content: [{ type: 'text', text: `Error: ${message}` }],
+    additionalContexts: [],
   }
+}
 
-  // The clamp rewrites even though the tool is hidden: an argument the model
-  // replayed from an older turn still fails the body's own validation.
-  const decision = await post[0](exec, result, async () => ({ kind: 'accept' }))
-
-  assert.equal(decision.kind, 'block')
-  const text = decision.feedback[0].text
-  assert.match(text, /invalid justification/)
-  assert.match(text, /The write call did not run/)
-  assert.match(text, /danger-full-access/)
+test('write and edit lose only the escalation pair in model declarations', () => {
+  const { ctx, registered, parameters } = harness()
+  for (const name of ['write', 'edit']) registered.set(name, new FileTool(name))
+  apply(ctx)
+  for (const name of registered.keys()) {
+    assert.deepEqual(Object.keys(parameters(name).properties), ['file_path', 'content'])
+    assert.deepEqual(parameters(name).required, argumentSchema.required)
+  }
+  assert.deepEqual(Object.keys(argumentSchema.properties), ['file_path', 'content', ...Object.keys(pair)])
 })
 
-test('leaves unrelated failures and successful calls alone', async () => {
-  const { ctx, registry, agent, handlers } = harness()
-  registry.registerFor(undefined, tool('write', { file_path: { type: 'string' } }))
-  apply(ctx, {})
-  const post = handlers.get('tools/post-execute')[0]
-
-  const unrelated = {
-    name: 'write',
-    agent,
-    arguments: { file_path: 'a.txt', sandbox_permissions: 'workspace-write', justification: 'x' },
+test('repairs stale write and edit arguments once and preserves the invocation context', () => {
+  const { ctx, agent, registered, invoke } = harness()
+  for (const name of ['write', 'edit']) registered.set(name, new FileTool(name))
+  apply(ctx)
+  for (const [name, tool] of registered) {
+    assert.equal(invoke(name, staleArgs), name)
+    assert.deepEqual(tool.calls, [{ args: bareArgs, exec: { agent } }])
+    assert(Object.isFrozen(tool.calls[0].args))
   }
-  const failure = { isError: true, content: [{ type: 'text', text: 'Error: ENOENT' }] }
-  assert.equal((await post(unrelated, failure, async () => ({ kind: 'accept' }))).kind, 'accept')
-
-  const success = { isError: false, content: [{ type: 'text', text: 'sandbox_permissions noted' }] }
-  assert.equal((await post(unrelated, success, async () => ({ kind: 'accept' }))).kind, 'accept')
-
-  const cleanArgs = { name: 'write', agent, arguments: { file_path: 'a.txt' } }
-  assert.equal((await post(cleanArgs, failure, async () => ({ kind: 'accept' }))).kind, 'accept')
+  assert.equal(staleArgs.sandbox_permissions, 'workspace-write')
 })
 
-test('unloads every shadow when the plugin is disposed', async () => {
-  const registry = new Registry()
-  const handlers = new Map()
-  const disposers = []
-  const agents = []
-  const ctx = {
-    tools: registry,
-    logger: { warn() {} },
-    get(name) {
-      if (name === 'agents') return { list: () => agents }
-      if (name === 'approval') return { overrideOf: () => undefined, config: { policy: 'never' } }
-      if (name === 'sandboxPolicy') return { resolve: () => ({ mode: 'danger-full-access' }) }
-      return undefined
-    },
-    on(event, handler) {
-      const list = handlers.get(event) ?? []
-      list.push(handler)
-      handlers.set(event, list)
-    },
-    effect(fn) { disposers.push(fn()) },
+test('honors a live policy switch and passes a valid wider approval request through', () => {
+  const { ctx, registered, state, parameters, invoke } = harness({ mode: 'read-only', policy: 'ask' })
+  const write = new FileTool()
+  registered.set('write', write)
+  apply(ctx)
+  const approvedArgs = { ...staleArgs, justification: 'Write within the workspace' }
+  assert.equal(parameters('write'), argumentSchema)
+  invoke('write', approvedArgs)
+  assert.equal(write.calls[0].args, approvedArgs)
+  state.policy = 'never'
+  assert(!Object.hasOwn(parameters('write').properties, 'sandbox_permissions'))
+  invoke('write', approvedArgs)
+  assert.deepEqual(write.calls[1].args, bareArgs)
+})
+
+test('defers to the original tool when the sandbox policy cannot be resolved', () => {
+  const { ctx, registered, parameters, invoke } = harness({ mode: undefined })
+  const write = new FileTool()
+  registered.set('write', write)
+  ctx.get = () => undefined
+  apply(ctx)
+  assert.equal(parameters('write'), argumentSchema)
+  invoke('write', staleArgs)
+  assert.equal(write.calls[0].args, staleArgs)
+})
+
+test('preserves business fields and ignores the executor-owned run_code transport', async () => {
+  const { ctx, agent, registry, registered, run } = harness()
+  class BusinessTool extends FileTool {
+    get parameters() {
+      return { type: 'object', properties: { justification: { type: 'string' } }, required: ['justification'] }
+    }
   }
-  registry.onChange(() => { for (const handler of handlers.get('tools/change') ?? []) handler() })
-  const agent = {
-    name: 'lead',
-    session: { id: 's' },
-    ctx: { tools: { register: definition => registry.registerFor(agent, definition) }, effect: fn => fn() },
+  class CustomTool extends FileTool {
+    get parameters() {
+      return { type: 'object', properties: { ...pair, sandbox_permissions: { type: 'string', enum: ['admin'] } } }
+    }
   }
-  agents.push(agent)
-  registry.registerFor(undefined, tool('write', { file_path: { type: 'string' } }))
+  const result = failure('SANDBOX_ESCALATION_INVALID_ARGUMENT', 'Invalid justification')
+  for (const tool of [new BusinessTool('business'), new CustomTool('custom'), new FileTool('run_code')]) {
+    registered.set(tool.name, tool)
+  }
+  apply(ctx)
+  for (const tool of registered.values()) {
+    assert.equal(registry.definitions(agent).find(entry => entry.name === tool.name), tool)
+    assert.equal(registry.executable(tool.name, agent), tool)
+    assert.equal(await run(tool.name, staleArgs, result), result)
+  }
+})
 
-  apply(ctx, {})
-  assert.equal(advertises(registry, agent, 'write'), false)
+test('applies exclude and a fixed tool list to schema, execution, and explanation', async () => {
+  const { ctx, agent, registered, registry, run } = harness()
+  for (const name of ['write', 'edit', 'apply_patch']) registered.set(name, new FileTool(name))
+  apply(ctx, { discover: false, tools: ['write', 'edit'], exclude: ['edit'] })
+  const result = failure('SANDBOX_ESCALATION_INVALID_ARGUMENT', 'Invalid justification')
+  for (const name of ['edit', 'apply_patch']) {
+    const original = registered.get(name)
+    assert.equal(registry.definitions(agent).find(entry => entry.name === name), original)
+    assert.equal(registry.executable(name, agent), original)
+    assert.equal(await run(name, staleArgs, result), result)
+  }
+  const explained = await run('write', staleArgs, result)
+  assert.match(explained.error.message, /Retry without sandbox_permissions and justification/)
+  assert.match(explained.content.at(-1).text, /Retry without/)
+  assert.equal(explained.error.info, result.error.info)
+  assert.equal(explained.additionalContexts, result.additionalContexts)
+})
 
-  for (const dispose of disposers.splice(0)) dispose()
+test('forwards output, prototype methods and non-enumerable tool properties', () => {
+  const { ctx, registered, registry, agent } = harness()
+  const write = new FileTool()
+  registered.set('write', write)
+  apply(ctx)
+  for (const tool of [registry.executable('write', agent), ...registry.definitions(agent)]) {
+    assert.equal(tool.description, 'Use write')
+    assert.equal(tool.timeoutMs, 100)
+    assert.equal(tool.output.schema.type, 'string')
+    assert.equal(tool.isConcurrencySafe(), true)
+    for (const key of ['presentCall', 'presentResult', 'projectContent', 'finalizeContent']) {
+      const callback = tool[key]
+      assert.equal(callback(), 'write')
+    }
+  }
+})
 
-  assert.equal(advertises(registry, agent, 'write'), true)
+test('preserves denials and drops misleading escalation hints only when an ask is impossible', async () => {
+  const { ctx, registered, state, run } = harness({ mode: 'read-only', policy: 'never' })
+  registered.set('write', new FileTool())
+  apply(ctx)
+  const denied = failure('FS_SANDBOX_DENIED', `${denial}\n${hint}\nKeep this detail.`)
+  const cleaned = await run('write', staleArgs, denied)
+  assert.equal(cleaned.error.info, denied.error.info)
+  assert.equal(cleaned.error.message, `${denial}\nKeep this detail.`)
+  assert.deepEqual(cleaned.content, [{ type: 'text', text: `Error: ${denial}\nKeep this detail.` }])
+  const cleanCallDenial = await run('write', bareArgs, denied)
+  assert.deepEqual(cleanCallDenial, cleaned)
+  state.policy = 'ask'
+  assert.equal(await run('write', staleArgs, denied), denied)
+})
+
+test('leaves failures with unrelated codes and user approval outcomes intact', async () => {
+  const { ctx, registered, run } = harness()
+  registered.set('write', new FileTool())
+  apply(ctx)
+  for (const code of ['OTHER', 'SANDBOX_ESCALATION_REJECTED', 'SANDBOX_ESCALATION_CANCELLED']) {
+    const result = failure(code, 'sandbox_permissions: invalid justification')
+    assert.equal(await run('write', staleArgs, result), result)
+  }
+})
+
+test('only wraps current lookup results and restores the original methods on unload', () => {
+  const { ctx, registered, registry, agent, unload } = harness()
+  const { definitions, executable } = registry
+  apply(ctx)
+  assert.equal(registry.executable('write', agent), undefined)
+  const write = new FileTool()
+  registered.set('write', write)
+  assert.notEqual(registry.executable('write', agent), write)
+  assert.equal(registry.executable('write', agent, new Set()), undefined)
+  registered.delete('write')
+  assert.equal(registry.executable('write', agent), undefined)
+  unload()
+  assert.equal(registry.definitions, definitions)
+  assert.equal(registry.executable, executable)
 })

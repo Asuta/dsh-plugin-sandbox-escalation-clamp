@@ -2,8 +2,7 @@
     - id: sandbox-escalation-clamp
       name: '@local/dsh-plugin-sandbox-escalation-clamp'
       config:
-        # Shadow every tool that advertises sandbox_permissions/justification,
-        # whether it is pwsh, bash, write, edit, or a capability mounted later.
+        # Discover tools that declare the optional DSH escalation pair.
         discover: true
         hideEscalationFields: true
         repairCalls: true

@@ -1,75 +1,21 @@
-/**
- * Sandbox escalation clamp.
- *
- * A session whose sandbox policy can never be widened still receives the
- * `sandbox_permissions` + `justification` parameters of every confining tool.
- * Which tools carry them is decided by the mounted capabilities, not by this
- * plugin: with both a confining filesystem and a confining shell the pair is
- * advertised on `write`, `edit`, `pwsh` and `bash` alike. A model that fills
- * those parameters anyway is rejected inside the tool body — the failure mode
- * observed in session-400b8db7 (22 identical `pwsh` calls dying on
- * `invalid justification: expected a non-empty sentence`) repeated in
- * session-ba3291a0 on `write`, because an earlier version clamped only the
- * tools named in its own configuration.
- *
- * This plugin removes that trap for the agents that cannot escalate:
- *
- * - Hide: an agent-scoped shadow definition whose `parameters` never advertise
- *   the escalation pair while the session cannot widen (approval policy `never`,
- *   or standing mode already `danger-full-access`). A session that can still
- *   escalate keeps the stock schema, so legitimate escalation is untouched.
- * - Repair: the shadow delegates execution to the inherited tool definition after
- *   dropping escalation arguments that cannot produce a grant, so the command
- *   runs instead of failing validation.
- * - Explain: a remaining escalation error is rewritten into one actionable
- *   instruction naming the tool and the exact fix.
- *
- * The clamp discovers its targets instead of trusting a hand-maintained list:
- * every tool the agent resolves that advertises either escalation parameter is
- * shadowed, and the registry's `tools/change` notification re-scans after a
- * capability registers late, so a tool mounted after the agent was created is
- * still covered from the next step onward.
- *
- * Tools resolve from the preset or global scope the agent inherits, so the
- * definition is captured once per agent; the schema getter still re-evaluates
- * the session's current policy on every projection.
- *
- * @module @local/dsh-plugin-sandbox-escalation-clamp
- */
-
+/** Clamp DSH one-shot escalation fields after the registry resolves a tool. */
 export const name = 'sandbox-escalation-clamp'
-
-
-/** The tool registry is the only required service; approvals and policy are optional. */
 export const inject = ['tools']
 
-/** The escalation pair travels together; both are withdrawn or repaired as a unit. */
+const ORIGINAL_SERVICE = Symbol.for('cordis.original')
 const ESCALATION_KEYS = ['sandbox_permissions', 'justification']
+const ESCALATION_TARGETS = ['workspace-write', 'danger-full-access']
+const WIDER_MODES = new Map([
+  ['read-only', ESCALATION_TARGETS],
+  ['workspace-write', ['danger-full-access']],
+  ['danger-full-access', []],
+])
+const ESCALATION_HINT = /^\[sandbox: escalation available — retry this exact (?:operation|command) once with sandbox_permissions .*\]$/
+const FORWARDED_TOOL_FIELDS = [
+  'name', 'description', 'output', 'deferLoading', 'timeoutMs', 'isConcurrencySafe',
+  'presentCall', 'presentResult', 'projectContent', 'finalizeContent',
+]
 
-/** The closed strictly-wider ladder, mirroring `@deepseek-ai/dsh-sandbox`. */
-const WIDER_MODES = {
-  'read-only': ['workspace-write', 'danger-full-access'],
-  'workspace-write': ['danger-full-access'],
-  'danger-full-access': [],
-}
-
-/**
- * Names that can never be shadowed. `run_code` is the reserved PTC transport:
- * the registry rejects any registration of that name, and the nested calls it
- * dispatches are clamped by the tools they reach, not by the transport.
- */
-const RESERVED_TOOL_NAMES = new Set(['run_code'])
-
-/**
- * Configuration keys consumed by {@link apply}. Declared here for readers only:
- * the bundle exports no `Config` schema, so no package import is required at
- * load time and the row's `config` reaches `apply` as written.
- *
- * `discover` (default `true`) is what keeps the clamp complete: it shadows every
- * tool that advertises the escalation pair rather than the names listed in
- * `tools`. Set it to `false` together with an explicit `tools` list only to
- * clamp a fixed subset.
- */
 export const CONFIG_KEYS = Object.freeze({
   discover: true,
   tools: [],
@@ -79,294 +25,179 @@ export const CONFIG_KEYS = Object.freeze({
   explainErrors: true,
 })
 
-/**
- * The session's effective approval policy.
- * @param ctx - plugin context.
- * @param session - the calling agent's session.
- * @returns `ask` or `never`; a composition without the approval seam can never grant.
- */
-function approvalPolicyOf(ctx, session) {
-  const approval = ctx.get('approval')
-  if (approval === undefined) return 'never'
-  const override = typeof approval.overrideOf === 'function' ? approval.overrideOf(session) : undefined
-  return override ?? approval.config?.policy ?? 'ask'
-}
-
-/**
- * The session's standing file-effect mode.
- * @param ctx - plugin context.
- * @param session - the calling agent's session.
- * @returns the resolved mode, or undefined when no policy service is composed.
- */
-function standingModeOf(ctx, session) {
-  const policy = ctx.get('sandboxPolicy')
-  if (policy === undefined || typeof policy.resolve !== 'function') return undefined
+function sandboxState(ctx, session) {
   try {
-    return policy.resolve({ session })?.mode
+    const mode = ctx.get('sandboxPolicy')?.resolve({ session })?.mode
+    if (!WIDER_MODES.has(mode)) return undefined
+    if (mode === 'danger-full-access') return { mode, cannotEscalate: 'this session already has full sandbox access' }
+    const approval = ctx.get('approval')
+    const policy = approval?.overrideOf?.(session) ?? approval?.config?.policy ?? 'ask'
+    if (approval === undefined || policy === 'never') {
+      return { mode, cannotEscalate: 'sandbox escalation approval is unavailable in this session' }
+    }
+    if (policy === 'ask') return { mode }
   } catch {
-    return undefined
+    // Leave the stock tool in charge if its policy cannot be determined.
   }
-}
-
-/**
- * Why this session cannot escalate, if it cannot.
- * @param ctx - plugin context.
- * @param session - the calling agent's session.
- * @returns a stable reason tag, or undefined when a wider mode is still reachable.
- */
-function escalatesNowhere(ctx, session) {
-  const mode = standingModeOf(ctx, session)
-  if (mode === undefined) return undefined
-  if (mode === 'danger-full-access') return 'session-already-full-access'
-  if (approvalPolicyOf(ctx, session) === 'never') return 'approval-policy-never'
   return undefined
 }
 
-/**
- * Whether a parameter schema advertises the escalation pair.
- * @param parameters - tool parameter schema.
- * @returns true when either escalation key is declared.
- */
+/** Identify the optional DSH pair, including its closed sandbox target enum. */
 function advertisesEscalation(parameters) {
   const properties = parameters?.properties
-  if (properties === null || typeof properties !== 'object') return false
-  return ESCALATION_KEYS.some(key => Object.prototype.hasOwnProperty.call(properties, key))
+  if (properties == null || !ESCALATION_KEYS.every(key => Object.hasOwn(properties, key))) return false
+  if (parameters.required !== undefined && (!Array.isArray(parameters.required)
+    || ESCALATION_KEYS.some(key => parameters.required.includes(key)))) return false
+  const { sandbox_permissions: permission, justification } = properties
+  return permission?.type === 'string' && justification?.type === 'string'
+    && Array.isArray(permission.enum) && permission.enum.length > 0
+    && permission.enum.every(value => ESCALATION_TARGETS.includes(value))
 }
 
-/**
- * Copy a parameter schema without the escalation pair.
- * @param parameters - tool parameter schema.
- * @returns the stripped copy; the input is never mutated.
- */
 function withoutEscalationFields(parameters) {
-  if (parameters === null || typeof parameters !== 'object') return parameters
-  const copy = structuredClone(parameters)
-  const properties = copy.properties
-  if (properties !== null && typeof properties === 'object') {
-    for (const key of ESCALATION_KEYS) delete properties[key]
-  }
-  if (Array.isArray(copy.required)) {
-    copy.required = copy.required.filter(entry => !ESCALATION_KEYS.includes(entry))
-    if (copy.required.length === 0) delete copy.required
-  }
-  return copy
+  const properties = { ...parameters.properties }
+  for (const key of ESCALATION_KEYS) delete properties[key]
+  return { ...parameters, properties }
 }
 
-/**
- * Drop escalation arguments that cannot produce a grant.
- *
- * The tools validate the pair inside their own `execute` (the sandbox escalation
- * helper throws `SandboxEscalationError` before the mutation or command runs),
- * so rewriting the arguments before delegating is enough to let the call
- * succeed; the model-facing schema is what keeps the pair from being sent at
- * all.
- *
- * @param ctx - plugin context.
- * @param session - the calling agent's session.
- * @param args - parsed model arguments.
- * @returns the original arguments, or a copy without the escalation pair.
- */
-function clampArguments(ctx, session, args) {
-  if (args === null || typeof args !== 'object' || Array.isArray(args)) return args
-  const hasPermissions = Object.prototype.hasOwnProperty.call(args, 'sandbox_permissions')
-  const hasJustification = Object.prototype.hasOwnProperty.call(args, 'justification')
-  if (!hasPermissions && !hasJustification) return args
-  const blocked = escalatesNowhere(ctx, session) !== undefined
-  const mode = standingModeOf(ctx, session)
-  const widens = hasPermissions && (WIDER_MODES[mode] ?? []).includes(args.sandbox_permissions)
-  const justified = typeof args.justification === 'string' && args.justification.trim() !== ''
-  if (!blocked && hasPermissions && widens && justified) return args
-  const cleaned = { ...args }
-  delete cleaned.sandbox_permissions
-  delete cleaned.justification
-  return cleaned
-}
-
-/**
- * Build the agent-scoped shadow definition.
- *
- * The inherited definition is captured once: tool plugins resolve from the
- * preset/global scope, whose registrations are final by `agent/created`, and an
- * agent-scoped shadow hides the inherited entry from further lookup. Every other
- * field is copied as-is so presentation, timeout, and safety classification keep
- * behaving exactly like the inherited tool.
- *
- * @param ctx - plugin context.
- * @param agent - the agent that owns the shadow.
- * @param definition - the definition this agent currently resolves.
- * @param settings - resolved plugin configuration.
- * @returns a definition that delegates to the captured definition.
- */
-function createShadow(ctx, agent, definition, settings) {
-  const shadow = { ...definition }
-  Object.defineProperties(shadow, {
-    description: { enumerable: true, configurable: true, get: () => definition.description },
-    parameters: {
-      enumerable: true,
-      configurable: true,
-      get: () => {
-        const hide = settings.hideEscalationFields && escalatesNowhere(ctx, agent.session) !== undefined
-        return hide ? withoutEscalationFields(definition.parameters) : definition.parameters
-      },
-    },
-  })
-  shadow.execute = async (args, exec) => {
-    const cleaned = settings.repairCalls ? clampArguments(ctx, agent.session, args) : args
-    return definition.execute(cleaned, exec)
-  }
-  return shadow
-}
-
-/** Concatenate the text of model-facing content blocks. */
-function contentText(content) {
-  if (!Array.isArray(content)) return ''
-  return content.filter(block => block?.type === 'text').map(block => block.text).join('\n')
-}
-
-/** Whether the recorded arguments asked for escalation. */
 function carriesEscalation(args) {
-  if (args === null || typeof args !== 'object' || Array.isArray(args)) return false
-  return ESCALATION_KEYS.some(key => Object.prototype.hasOwnProperty.call(args, key))
+  return args !== null && typeof args === 'object' && !Array.isArray(args)
+    && ESCALATION_KEYS.some(key => Object.hasOwn(args, key))
 }
 
-/**
- * The actionable rewrite of a refused escalation.
- * @param reason - why the session cannot widen, if it cannot.
- * @param mode - the standing mode, when known.
- * @param original - the original model-facing error text.
- * @param toolName - the tool whose call was refused.
- * @returns replacement text for the tool result.
- */
-function explanation(reason, mode, original, toolName) {
-  const why = reason === 'session-already-full-access'
-    ? 'this session already runs at `danger-full-access`, so there is no wider mode to request'
-    : reason === 'approval-policy-never'
-      ? 'approvals are disabled in this session, so an escalation can never be granted'
-      : `\`sandbox_permissions\` must name a strictly wider mode than the standing "${mode ?? 'current'}" mode`
-  return `${original}\n\n`
-    + `The ${toolName ?? 'tool'} call did not run. Re-issue the identical call without `
-    + `\`sandbox_permissions\` and \`justification\`; ${why}.`
+function clampArguments(ctx, session, args) {
+  if (!carriesEscalation(args)) return args
+  const state = sandboxState(ctx, session)
+  if (state === undefined) return args
+  const widens = Object.hasOwn(args, 'sandbox_permissions') && WIDER_MODES.get(state.mode).includes(args.sandbox_permissions)
+  const justified = Object.hasOwn(args, 'justification')
+    && typeof args.justification === 'string' && args.justification.trim() !== ''
+  if (!state.cannotEscalate && widens && justified) return args
+  const cleaned = { ...args }
+  for (const key of ESCALATION_KEYS) delete cleaned[key]
+  return Object.freeze(cleaned)
 }
 
-/**
- * Mount the clamp.
- * @param ctx - plugin context.
- * @param config - row configuration from `cordis.patch.yml`.
- */
-export function apply(ctx, config = {}) {
-  const settings = {
-    discover: config.discover ?? true,
-    tools: [...new Set(Array.isArray(config.tools) ? config.tools.filter(entry => typeof entry === 'string') : [])],
-    exclude: new Set(Array.isArray(config.exclude) ? config.exclude.filter(entry => typeof entry === 'string') : []),
-    hideEscalationFields: config.hideEscalationFields ?? true,
-    repairCalls: config.repairCalls ?? true,
-    explainErrors: config.explainErrors ?? true,
+/** A temporary view of an admitted definition, never a registry contribution. */
+function wrapDefinition(definition, parameters, execute) {
+  const wrapped = { parameters, execute }
+  for (const key of FORWARDED_TOOL_FIELDS) {
+    Object.defineProperty(wrapped, key, {
+      enumerable: true,
+      get() {
+        const value = definition[key]
+        return typeof value === 'function' ? value.bind(definition) : value
+      },
+    })
   }
-  /** Per-agent shadow sets, keyed by the agent whose scope owns them. */
-  const records = new Map()
-  let active = true
-  /** Re-entrancy guard: our own registrations emit `tools/change`. */
-  let scanning = false
-  /** A registry change that arrived while scanning; re-run once instead of recursing. */
-  let rescan = false
+  return wrapped
+}
 
-  const liveAgents = () => [...(ctx.get('agents')?.list?.() ?? [])]
-
-  const recordFor = agent => {
-    const existing = records.get(agent)
-    if (existing !== undefined) return existing
-    const record = {
-      names: new Set(),
-      disposers: [],
-      /** Disposers for this agent's shadows, in registration order. */
-      disposeAll: () => { for (const disposer of record.disposers.splice(0)) disposer() },
-      /** Agent-scoped effect that tears the record down with the agent. */
-      owned: undefined,
-    }
-    records.set(agent, record)
-    return record
-  }
-
-  const installShadow = (agent, record, toolName) => {
-    if (RESERVED_TOOL_NAMES.has(toolName) || settings.exclude.has(toolName) || record.names.has(toolName)) return
-    const definition = ctx.tools.get(toolName, agent)
-    if (definition === undefined || !advertisesEscalation(definition.parameters)) return
-    // Claim the name before registering: `register` emits `tools/change`
-    // synchronously, and the re-entrant scan must see the claim as final.
-    record.names.add(toolName)
-    try {
-      if (record.owned === undefined) {
-        record.owned = agent.ctx.effect(() => () => {
-          records.delete(agent)
-          record.disposeAll()
-        }, 'sandbox-escalation-clamp: agent shadow')
+/** Wrap the two output boundaries without changing resolve(), get(), or step admission. */
+function wrapLookups(registry, wrappers) {
+  const restore = []
+  try {
+    for (const [method, wrap] of Object.entries(wrappers)) {
+      const own = Object.getOwnPropertyDescriptor(registry, method)
+      const original = registry[method]
+      if (typeof original !== 'function') throw new TypeError(`ToolsService.${method} is unavailable`)
+      const replacement = function (...args) {
+        const value = Reflect.apply(original, this, args)
+        return wrap(value, args)
       }
-      record.disposers.push(agent.ctx.tools.register(createShadow(ctx, agent, definition, settings)))
-    } catch (error) {
-      record.names.delete(toolName)
-      ctx.logger?.warn?.(`sandbox-escalation-clamp: cannot shadow "${toolName}": ${String(error)}`)
+      Object.defineProperty(registry, method, {
+        value: replacement, configurable: true, writable: true, enumerable: own?.enumerable ?? false,
+      })
+      restore.push(() => {
+        if (Object.getOwnPropertyDescriptor(registry, method)?.value !== replacement) return
+        if (own === undefined) delete registry[method]
+        else Object.defineProperty(registry, method, own)
+      })
     }
+  } catch (error) {
+    for (const undo of restore.reverse()) undo()
+    throw error
   }
+  return () => { for (const undo of restore.reverse()) undo() }
+}
 
-  const clampAgent = agent => {
-    if (!active) return
-    const record = recordFor(agent)
-    for (const toolName of settings.tools) installShadow(agent, record, toolName)
-    if (!settings.discover) return
-    for (const definition of ctx.tools.definitions(agent) ?? []) installShadow(agent, record, definition.name)
+function stringNames(value) {
+  return new Set(Array.isArray(value) ? value.filter(entry => typeof entry === 'string') : [])
+}
+
+function stripEscalationHint(text) {
+  return text.split(/\r?\n/).filter(line => !ESCALATION_HINT.test(line)).join('\n')
+}
+
+function explainFailure(ctx, exec, result) {
+  if (!result.isError) return result
+  const { code } = result.error.info ?? {}
+  if (code === 'FS_SANDBOX_DENIED' && sandboxState(ctx, exec.agent.session)?.cannotEscalate) {
+    const { message } = result.error
+    const cleanedMessage = stripEscalationHint(message)
+    const content = result.content.map(block => block.type === 'text'
+      ? { ...block, text: stripEscalationHint(block.text) }
+      : block)
+    return { ...result, error: { ...result.error, message: cleanedMessage }, content }
   }
+  if (code !== 'SANDBOX_ESCALATION_INVALID_ARGUMENT' || !carriesEscalation(exec.arguments)) return result
+  const state = sandboxState(ctx, exec.agent.session)
+  const advice = state?.cannotEscalate
+    ? `Retry without sandbox_permissions and justification if the operation is still needed. ${state.cannotEscalate}.`
+    : 'For a normal call, omit sandbox_permissions and justification. For an approved retry of a sandbox-denied operation, request a strictly wider mode and include a non-empty justification.'
+  return {
+    ...result,
+    error: { ...result.error, message: `${result.error.message}\n\n${advice}` },
+    content: [...result.content, { type: 'text', text: advice }],
+  }
+}
 
-  const scanAll = () => {
-    if (!active) return
-    if (scanning) {
-      rescan = true
-      return
-    }
-    scanning = true
+export function apply(ctx, config = {}) {
+  const settings = { ...CONFIG_KEYS, ...config }
+  const tools = stringNames(settings.tools)
+  const exclude = stringNames(settings.exclude)
+  const matches = definition => definition !== undefined && definition.name !== 'run_code'
+    && !exclude.has(definition.name) && (settings.discover || tools.has(definition.name))
+    && advertisesEscalation(definition.parameters)
+
+  const service = ctx.tools
+  const registry = service[ORIGINAL_SERVICE] ?? service
+  const originalExecutable = registry.executable
+  let active = false
+
+  ctx.effect(() => {
+    let restore
     try {
-      do {
-        rescan = false
-        for (const agent of liveAgents()) clampAgent(agent)
-      } while (rescan && active)
-    } finally {
-      scanning = false
+      restore = wrapLookups(registry, {
+        definitions(definitions, [scope]) {
+          if (!active || !settings.hideEscalationFields || scope?.session === undefined
+            || !sandboxState(ctx, scope.session)?.cannotEscalate) return definitions
+          return definitions.map(definition => matches(definition)
+            ? wrapDefinition(definition, withoutEscalationFields(definition.parameters), definition.execute.bind(definition))
+            : definition)
+        },
+        executable(definition, [, scope]) {
+          if (!active || !settings.repairCalls || scope?.session === undefined || !matches(definition)) return definition
+          return wrapDefinition(definition, definition.parameters, (args, exec) => {
+            const cleaned = active && exec.agent === scope ? clampArguments(ctx, scope.session, args) : args
+            return definition.execute(cleaned, exec)
+          })
+        },
+      })
+      active = true
+    } catch (error) {
+      ctx.logger?.warn?.(`sandbox-escalation-clamp: incompatible tools service: ${String(error)}`)
     }
-  }
-
-  const disposeShadow = agent => {
-    const record = records.get(agent)
-    if (record === undefined) return
-    records.delete(agent)
-    record.disposeAll()
-    record.owned?.()
-  }
-
-  ctx.effect(() => () => {
-    active = false
-    for (const agent of [...records.keys()]) disposeShadow(agent)
-  }, 'sandbox-escalation-clamp')
-
-  ctx.on('agent/created', ({ agent }) => { clampAgent(agent) })
-  ctx.on('agent/disposed', ({ agent }) => { disposeShadow(agent) })
-
-  // A capability that registers after the agent exists (or a session-visible
-  // variant replacing a definition) is picked up here rather than at creation.
-  ctx.on('tools/change', () => { scanAll() })
-
-  for (const agent of liveAgents()) clampAgent(agent)
-
-  ctx.on('tools/post-execute', async (exec, result, next) => {
-    const decision = await next()
-    if (!settings.explainErrors || decision.kind !== 'accept' || result.isError !== true) return decision
-    if (!carriesEscalation(exec.arguments)) return decision
-    const text = contentText(decision.content ?? result.content)
-    if (!/sandbox_permissions|invalid justification|sandbox escalation/i.test(text)) return decision
-    const reason = exec.agent === undefined ? undefined : escalatesNowhere(ctx, exec.agent.session)
-    const mode = exec.agent === undefined ? undefined : standingModeOf(ctx, exec.agent.session)
-    return {
-      kind: 'block',
-      feedback: [{ type: 'text', text: explanation(reason, mode, text, exec.name) }],
-      ...result.error?.info !== undefined ? { info: result.error.info } : {},
+    return () => {
+      active = false
+      restore?.()
     }
+  }, 'sandbox-escalation-clamp: tool lookup adapter')
+
+  ctx.on('tools/execute', async (exec, next) => {
+    const result = await next()
+    if (!active || !settings.explainErrors || !result.isError || exec.agent === undefined) return result
+    const definition = Reflect.apply(originalExecutable, registry, [exec.name, exec.agent, exec.toolSet])
+    return matches(definition) ? explainFailure(ctx, exec, result) : result
   })
 }
